@@ -99,8 +99,8 @@ using FileColumnIteratorFactory =
     std::function<FileColumnIterator*(int, ParquetFileReader*)>;
 
 Status TransferColumnData(::parquet::internal::RecordReader* reader,
-                          std::shared_ptr<::arrow::DataType> value_type,
-                          const ColumnDescriptor* descr, ::arrow::MemoryPool* pool,
+                          const ::arrow::Field& field, const ColumnDescriptor* descr,
+                          ::arrow::MemoryPool* pool,
                           std::shared_ptr<::arrow::ChunkedArray>* out);
 
 struct ReaderContext {

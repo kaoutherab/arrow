@@ -3516,7 +3516,17 @@ TEST_F(TestNestedSchemaRead, ReadIntoTableFull) {
   // validate struct array
   ASSERT_NO_FATAL_FAILURE(ValidateArray(*struct_field_array, NUM_SIMPLE_TEST_ROWS / 3));
   // validate leaf1
-  ASSERT_NO_FATAL_FAILURE(ValidateColumnArray(*leaf1_array, NUM_SIMPLE_TEST_ROWS / 3));
+  ASSERT_NO_FATAL_FAILURE(ValidateArray(*leaf1_array, /*expected_nulls=*/0));
+  // Validate values manually here. The child array is non-nullable,
+  // but Parquet does not store null values, so we need to account for
+  // the struct's validity bitmap.
+  {
+    int j = 0;
+    for (int i = 0; i < values_array_->length(); i++) {
+      if (struct_field_array->IsNull(i)) continue;
+      ASSERT_EQ(leaf1_array->Value(i), values_array_->Value(j++));
+    }
+  }
   // validate leaf2
   ASSERT_NO_FATAL_FAILURE(
       ValidateColumnArray(*leaf2_array, NUM_SIMPLE_TEST_ROWS * 2 / 3));

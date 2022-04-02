@@ -304,8 +304,8 @@ Status StatisticsAsScalars(const Statistics& statistics,
 namespace {
 
 template <typename ArrowType, typename ParquetType>
-Status TransferInt(RecordReader* reader, MemoryPool* pool,
-                   const std::shared_ptr<DataType>& type, Datum* out) {
+Status TransferInt(RecordReader* reader, MemoryPool* pool, const Field& field,
+                   Datum* out) {
   using ArrowCType = typename ArrowType::c_type;
   using ParquetCType = typename ParquetType::c_type;
   int64_t length = reader->values_written();
@@ -315,17 +315,29 @@ Status TransferInt(RecordReader* reader, MemoryPool* pool,
   auto values = reinterpret_cast<const ParquetCType*>(reader->values());
   auto out_ptr = reinterpret_cast<ArrowCType*>(data->mutable_data());
   std::copy(values, values + length, out_ptr);
-  *out = std::make_shared<ArrayType<ArrowType>>(
-      type, length, std::move(data), reader->ReleaseIsValid(), reader->null_count());
+  auto validity_buffer = reader->ReleaseIsValid();
+  if (field.nullable()) {
+    *out = std::make_shared<ArrayType<ArrowType>>(field.type(), length, std::move(data),
+                                                  std::move(validity_buffer),
+                                                  reader->null_count());
+  } else {
+    *out = std::make_shared<ArrayType<ArrowType>>(field.type(), length, std::move(data),
+                                                  nullptr, 0);
+  }
   return Status::OK();
 }
 
 std::shared_ptr<Array> TransferZeroCopy(RecordReader* reader,
-                                        const std::shared_ptr<DataType>& type) {
+                                        const ::arrow::Field& field) {
+  int64_t null_count = reader->null_count();
   std::vector<std::shared_ptr<Buffer>> buffers = {reader->ReleaseIsValid(),
                                                   reader->ReleaseValues()};
-  auto data = std::make_shared<::arrow::ArrayData>(type, reader->values_written(),
-                                                   buffers, reader->null_count());
+  if (!field.nullable()) {
+    buffers[0] = nullptr;
+    null_count = 0;
+  }
+  auto data = std::make_shared<::arrow::ArrayData>(field.type(), reader->values_written(),
+                                                   buffers, null_count);
   return ::arrow::MakeArray(data);
 }
 
@@ -657,26 +669,26 @@ Status TransferDecimal(RecordReader* reader, MemoryPool* pool,
 
 }  // namespace
 
-#define TRANSFER_INT32(ENUM, ArrowType)                                              \
-  case ::arrow::Type::ENUM: {                                                        \
-    Status s = TransferInt<ArrowType, Int32Type>(reader, pool, value_type, &result); \
-    RETURN_NOT_OK(s);                                                                \
+#define TRANSFER_INT32(ENUM, ArrowType)                                         \
+  case ::arrow::Type::ENUM: {                                                   \
+    Status s = TransferInt<ArrowType, Int32Type>(reader, pool, field, &result); \
+    RETURN_NOT_OK(s);                                                           \
   } break;
 
-#define TRANSFER_INT64(ENUM, ArrowType)                                              \
-  case ::arrow::Type::ENUM: {                                                        \
-    Status s = TransferInt<ArrowType, Int64Type>(reader, pool, value_type, &result); \
-    RETURN_NOT_OK(s);                                                                \
+#define TRANSFER_INT64(ENUM, ArrowType)                                         \
+  case ::arrow::Type::ENUM: {                                                   \
+    Status s = TransferInt<ArrowType, Int64Type>(reader, pool, field, &result); \
+    RETURN_NOT_OK(s);                                                           \
   } break;
 
-Status TransferColumnData(RecordReader* reader, std::shared_ptr<DataType> value_type,
+Status TransferColumnData(RecordReader* reader, const ::arrow::Field& field,
                           const ColumnDescriptor* descr, MemoryPool* pool,
                           std::shared_ptr<ChunkedArray>* out) {
   Datum result;
   std::shared_ptr<ChunkedArray> chunked_result;
-  switch (value_type->id()) {
+  switch (field.type()->id()) {
     case ::arrow::Type::DICTIONARY: {
-      RETURN_NOT_OK(TransferDictionary(reader, value_type, &chunked_result));
+      RETURN_NOT_OK(TransferDictionary(reader, field.type(), &chunked_result));
       result = chunked_result;
     } break;
     case ::arrow::Type::NA: {
@@ -687,7 +699,7 @@ Status TransferColumnData(RecordReader* reader, std::shared_ptr<DataType> value_
     case ::arrow::Type::INT64:
     case ::arrow::Type::FLOAT:
     case ::arrow::Type::DOUBLE:
-      result = TransferZeroCopy(reader, value_type);
+      result = TransferZeroCopy(reader, field);
       break;
     case ::arrow::Type::BOOL:
       RETURN_NOT_OK(TransferBool(reader, pool, &result));
@@ -703,33 +715,33 @@ Status TransferColumnData(RecordReader* reader, std::shared_ptr<DataType> value_
       TRANSFER_INT64(TIME64, ::arrow::Time64Type);
       TRANSFER_INT64(DURATION, ::arrow::DurationType);
     case ::arrow::Type::DATE64:
-      RETURN_NOT_OK(TransferDate64(reader, pool, value_type, &result));
+      RETURN_NOT_OK(TransferDate64(reader, pool, field.type(), &result));
       break;
     case ::arrow::Type::FIXED_SIZE_BINARY:
     case ::arrow::Type::BINARY:
     case ::arrow::Type::STRING:
     case ::arrow::Type::LARGE_BINARY:
     case ::arrow::Type::LARGE_STRING: {
-      RETURN_NOT_OK(TransferBinary(reader, pool, value_type, &chunked_result));
+      RETURN_NOT_OK(TransferBinary(reader, pool, field.type(), &chunked_result));
       result = chunked_result;
     } break;
     case ::arrow::Type::DECIMAL128: {
       switch (descr->physical_type()) {
         case ::parquet::Type::INT32: {
           auto fn = DecimalIntegerTransfer<Int32Type>;
-          RETURN_NOT_OK(fn(reader, pool, value_type, &result));
+          RETURN_NOT_OK(fn(reader, pool, field.type(), &result));
         } break;
         case ::parquet::Type::INT64: {
           auto fn = &DecimalIntegerTransfer<Int64Type>;
-          RETURN_NOT_OK(fn(reader, pool, value_type, &result));
+          RETURN_NOT_OK(fn(reader, pool, field.type(), &result));
         } break;
         case ::parquet::Type::BYTE_ARRAY: {
           auto fn = &TransferDecimal<Decimal128Array, ByteArrayType>;
-          RETURN_NOT_OK(fn(reader, pool, value_type, &result));
+          RETURN_NOT_OK(fn(reader, pool, field.type(), &result));
         } break;
         case ::parquet::Type::FIXED_LEN_BYTE_ARRAY: {
           auto fn = &TransferDecimal<Decimal128Array, FLBAType>;
-          RETURN_NOT_OK(fn(reader, pool, value_type, &result));
+          RETURN_NOT_OK(fn(reader, pool, field.type(), &result));
         } break;
         default:
           return Status::Invalid(
@@ -741,11 +753,11 @@ Status TransferColumnData(RecordReader* reader, std::shared_ptr<DataType> value_
       switch (descr->physical_type()) {
         case ::parquet::Type::BYTE_ARRAY: {
           auto fn = &TransferDecimal<Decimal256Array, ByteArrayType>;
-          RETURN_NOT_OK(fn(reader, pool, value_type, &result));
+          RETURN_NOT_OK(fn(reader, pool, field.type(), &result));
         } break;
         case ::parquet::Type::FIXED_LEN_BYTE_ARRAY: {
           auto fn = &TransferDecimal<Decimal256Array, FLBAType>;
-          RETURN_NOT_OK(fn(reader, pool, value_type, &result));
+          RETURN_NOT_OK(fn(reader, pool, field.type(), &result));
         } break;
         default:
           return Status::Invalid(
@@ -755,16 +767,16 @@ Status TransferColumnData(RecordReader* reader, std::shared_ptr<DataType> value_
 
     case ::arrow::Type::TIMESTAMP: {
       const ::arrow::TimestampType& timestamp_type =
-          checked_cast<::arrow::TimestampType&>(*value_type);
+          checked_cast<::arrow::TimestampType&>(*field.type());
       if (descr->physical_type() == ::parquet::Type::INT96) {
         RETURN_NOT_OK(
-            TransferInt96(reader, pool, value_type, &result, timestamp_type.unit()));
+            TransferInt96(reader, pool, field.type(), &result, timestamp_type.unit()));
       } else {
         switch (timestamp_type.unit()) {
           case ::arrow::TimeUnit::MILLI:
           case ::arrow::TimeUnit::MICRO:
           case ::arrow::TimeUnit::NANO:
-            result = TransferZeroCopy(reader, value_type);
+            result = TransferZeroCopy(reader, field);
             break;
           default:
             return Status::NotImplemented("TimeUnit not supported");
@@ -773,7 +785,7 @@ Status TransferColumnData(RecordReader* reader, std::shared_ptr<DataType> value_
     } break;
     default:
       return Status::NotImplemented("No support for reading columns of type ",
-                                    value_type->ToString());
+                                    field.type()->ToString());
   }
 
   if (result.kind() == Datum::ARRAY) {
